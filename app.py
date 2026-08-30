@@ -371,10 +371,9 @@ def api_calculate():
 
 
 # ============================================================
-# HTML TEMPLATE
+# HTML TEMPLATE - USANDO COMILLAS TRIPLES SIMPLES
 # ============================================================
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
+HTML_TEMPLATE = '''<!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
@@ -699,8 +698,7 @@ HTML_TEMPLATE = '''
         }
     </script>
 </body>
-</html>
-'''
+</html>'''
 
 
 # ============================================================
