@@ -1,6 +1,6 @@
 """
-Bybit/Binance Perpetual Futures Calculator
-Resiliente a bloqueos de IP en Render.
+Bybit/Binance/BingX Perpetual Futures Calculator
+Calcula leverage y tamaño de posición. Exchange seleccionable, sin fallback entre exchanges.
 """
 
 from flask import Flask, render_template_string, request, jsonify
@@ -14,102 +14,276 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-BYBIT_API = "https://api.bybit.com"
-BINANCE_API = "https://fapi.binance.com"
+# ============================================================
+# CONFIG DE EXCHANGES
+# ============================================================
+EXCHANGES = ["bybit", "binance", "bingx", "lbank"]
+
+BASE_URLS = {
+    "bybit": "https://api.bybit.com",
+    "binance": "https://fapi.binance.com",
+    "bingx": "https://open-api.bingx.com",
+    "lbank": "https://lbkperp.lbank.com",
+}
+
 CACHE_TTL = 3600
 
+# Binance no expone el max leverage por símbolo sin API key (endpoint público inexistente).
+# Se usa un tope por defecto (125x, el máximo habitual de los perpétuos USDT-M) cuando el
+# exchangeInfo no trae el filtro LEVERAGE.
+BINANCE_DEFAULT_MAX_LEVERAGE = 125.0
+
+# BingX tampoco expone maxLongLeverage/maxShortLeverage en los endpoints públicos pese a la
+# documentación. Default: 125x, el máximo habitual de los perpétuos USDT-M de BingX.
+BINGX_DEFAULT_MAX_LEVERAGE = 125.0
+
 _cache = {
-    "symbols": None,
-    "timestamp": 0,
-    "instruments": {},
-    "last_error": None
+    "symbols": {},     # exchange -> {"items": [...], "timestamp": ts}
+    "instruments": {}, # (exchange, symbol) -> wrapper
+    "last_error": {}
 }
+
+# ============================================================
+# FETCHERS POR EXCHANGE
+# ============================================================
+def _fetch_bybit_symbols():
+    resp = requests.get(f"{BASE_URLS['bybit']}/v5/market/instruments-info",
+                        params={"category": "linear"}, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')}")
+    symbols = []
+    for item in data["result"]["list"]:
+        if item.get("contractType") == "LinearPerpetual" and item.get("quoteCoin") == "USDT":
+            symbols.append({
+                "symbol": item["symbol"],
+                "baseCoin": item["baseCoin"],
+                "quoteCoin": item["quoteCoin"],
+            })
+    return symbols
+
+
+def _fetch_binance_symbols():
+    resp = requests.get(f"{BASE_URLS['binance']}/fapi/v1/exchangeInfo", timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    symbols = []
+    for item in data.get("symbols", []):
+        if item.get("contractType") == "PERPETUAL" and item.get("quoteAsset") == "USDT":
+            symbols.append({
+                "symbol": item["symbol"],
+                "baseCoin": item["baseAsset"],
+                "quoteCoin": item["quoteAsset"],
+            })
+    return symbols
+
+
+def _fetch_bingx_symbols():
+    resp = requests.get(f"{BASE_URLS['bingx']}/openApi/swap/v2/quote/contracts", timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"BingX error {data.get('code')}: {data.get('msg')}")
+    symbols = []
+    for item in data.get("data", []):
+        if item.get("currency") == "USDT" and item.get("status") == 1:
+            symbols.append({
+                "symbol": item["symbol"],
+                "baseCoin": item["asset"],
+                "quoteCoin": item["currency"],
+            })
+    return symbols
+
+
+# El endpoint /cfd/openApi/v1/pub/instrument de LBank no filtra por `symbol`, así que se
+# trae y cachea el listado completo y se filtra en memoria.
+_lbank_instruments_cache = {"items": None, "timestamp": 0}
+
+
+def _fetch_lbank_instruments():
+    now = time.time()
+    cached = _lbank_instruments_cache
+    if cached["items"] and (now - cached["timestamp"]) < CACHE_TTL:
+        return cached["items"]
+    resp = requests.get(f"{BASE_URLS['lbank']}/cfd/openApi/v1/pub/instrument",
+                        params={"productGroup": "SwapU"}, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("data", []) or []
+    _lbank_instruments_cache["items"] = items
+    _lbank_instruments_cache["timestamp"] = now
+    return items
+
+
+def _fetch_lbank_symbols():
+    items = _fetch_lbank_instruments()
+    symbols = []
+    for item in items:
+        # needSuspend == 0 → contrato activo; todos los de SwapU son USDT.
+        if item.get("needSuspend") == 0 and item.get("clearCurrency") == "USDT":
+            symbols.append({
+                "symbol": item["symbol"],
+                "baseCoin": item.get("baseCurrency", ""),
+                "quoteCoin": item.get("clearCurrency", ""),
+            })
+    return symbols
+
+
+# ============================================================
+# INFO DE INSTRUMENTO POR EXCHANGE (normalizada)
+# ============================================================
+def _binance_filter(filters, filter_type):
+    for f in filters:
+        if f.get("filterType") == filter_type:
+            return f
+    return {}
+
+
+def _bybit_instrument(symbol):
+    resp = requests.get(f"{BASE_URLS['bybit']}/v5/market/instruments-info",
+                        params={"category": "linear", "symbol": symbol}, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("retCode") != 0 or not data["result"]["list"]:
+        raise RuntimeError(f"Bybit no encontró el símbolo {symbol}")
+    inst = data["result"]["list"][0]
+    lev = inst.get("leverageFilter", {})
+    lot = inst.get("lotSizeFilter", {})
+    return {
+        "symbol": inst["symbol"],
+        "baseCoin": inst["baseCoin"],
+        "quoteCoin": inst["quoteCoin"],
+        "maxLeverage": float(lev.get("maxLeverage", 0) or 0),
+        "leverageStep": float(lev.get("leverageStep", "1") or 1),
+        "qtyStep": float(lot.get("qtyStep", "0.001") or 0.001),
+        "minOrderQty": float(lot.get("minOrderQty", "0.001") or 0.001),
+        "minNotional": float(lot.get("minNotionalValue") or lot.get("minOrderAmt") or 5),
+    }
+
+
+def _binance_instrument(symbol):
+    resp = requests.get(f"{BASE_URLS['binance']}/fapi/v1/exchangeInfo", params={"symbol": symbol}, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("symbols"):
+        raise RuntimeError(f"Binance no encontró el símbolo {symbol}")
+    item = data["symbols"][0]
+    filters = item.get("filters", [])
+    lot = _binance_filter(filters, "LOT_SIZE")
+    lev = _binance_filter(filters, "LEVERAGE")
+    notional = _binance_filter(filters, "MIN_NOTIONAL")
+    max_lev = float(lev.get("maxLeverage")) if lev.get("maxLeverage") else BINANCE_DEFAULT_MAX_LEVERAGE
+    return {
+        "symbol": item["symbol"],
+        "baseCoin": item["baseAsset"],
+        "quoteCoin": item["quoteAsset"],
+        "maxLeverage": max_lev,
+        "leverageStep": float(lev.get("leverageStep", "1") or 1),
+        "qtyStep": float(lot.get("stepSize", "0.001") or 0.001),
+        "minOrderQty": float(lot.get("minQty", "0.001") or 0.001),
+        "minNotional": float(notional.get("notional") or notional.get("minNotional") or 5),
+    }
+
+
+def _bingx_instrument(symbol):
+    resp = requests.get(f"{BASE_URLS['bingx']}/openApi/swap/v2/quote/contracts",
+                        params={"symbol": symbol}, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0 or not data.get("data"):
+        raise RuntimeError(f"BingX no encontró el símbolo {symbol}")
+    item = data["data"][0]
+    qty_precision = int(item.get("quantityPrecision", 0) or 0)
+    max_long = float(item.get("maxLongLeverage", 0) or 0)
+    max_short = float(item.get("maxShortLeverage", 0) or 0)
+    max_lev = max_long or max_short or BINGX_DEFAULT_MAX_LEVERAGE
+    return {
+        "symbol": item["symbol"],
+        "baseCoin": item.get("asset", ""),
+        "quoteCoin": item.get("currency", ""),
+        "maxLeverage": max_lev,
+        "maxLongLeverage": max_long if max_long else None,
+        "maxShortLeverage": max_short if max_short else None,
+        "leverageStep": 1.0,
+        "qtyStep": float(10 ** (-qty_precision)) if qty_precision > 0 else 1.0,
+        "minOrderQty": float(item.get("tradeMinQuantity", 0) or 0),
+        "minNotional": float(item.get("tradeMinUSDT", 0) or 0),
+    }
+
+
+def _lbank_instrument(symbol):
+    items = _fetch_lbank_instruments()
+    for item in items:
+        if item.get("symbol") == symbol:
+            return {
+                "symbol": item["symbol"],
+                "baseCoin": item.get("baseCurrency", ""),
+                "quoteCoin": item.get("clearCurrency", item.get("priceCurrency", "")),
+                "maxLeverage": float(item.get("maxLeverage", 0) or 0),
+                "leverageStep": 1.0,
+                "qtyStep": float(item.get("volumeTick", "0.001") or 0.001),
+                "minOrderQty": float(item.get("minOrderVolume", 0) or 0),
+                "minNotional": float(item.get("minOrderCost", 0) or 0),
+            }
+    raise RuntimeError(f"LBank no encontró el símbolo {symbol}")
+
+
+_INSTRUMENT_FETCHERS = {
+    "bybit": _bybit_instrument,
+    "binance": _binance_instrument,
+    "bingx": _bingx_instrument,
+    "lbank": _lbank_instrument,
+}
+
+_SYMBOL_FETCHERS = {
+    "bybit": _fetch_bybit_symbols,
+    "binance": _fetch_binance_symbols,
+    "bingx": _fetch_bingx_symbols,
+    "lbank": _fetch_lbank_symbols,
+}
+
 
 # ============================================================
 # API FUNCTIONS
 # ============================================================
-def get_all_symbols():
-    """Obtiene símbolos de futuros USDT perpetuos desde Binance (más permisivo con Render)."""
+def _normalize_exchange(exchange):
+    exchange = (exchange or "").lower()
+    if exchange not in EXCHANGES:
+        raise ValueError(f"Exchange no soportado: {exchange}")
+    return exchange
+
+
+def get_all_symbols(exchange):
+    """Obtiene símbolos USDT perpetuos del exchange indicado (sin fallback)."""
+    exchange = _normalize_exchange(exchange)
     now = time.time()
-    if _cache["symbols"] and (now - _cache["timestamp"]) < CACHE_TTL:
-        return _cache["symbols"]
+    cached = _cache["symbols"].get(exchange)
+    if cached and (now - cached["timestamp"]) < CACHE_TTL:
+        return cached["items"]
 
-    logger.info("Consultando API de Binance para obtener símbolos...")
-    try:
-        resp = requests.get(f"{BINANCE_API}/fapi/v1/exchangeInfo", timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+    logger.info(f"Consultando símbolos de {exchange}...")
+    items = _SYMBOL_FETCHERS[exchange]()
+    items.sort(key=lambda x: x["symbol"])
 
-        symbols = []
-        for item in data.get("symbols", []):
-            if item.get("contractType") == "PERPETUAL" and item.get("quoteAsset") == "USDT":
-                symbols.append({
-                    "symbol": item["symbol"],
-                    "baseCoin": item["baseAsset"],
-                    "quoteCoin": item["quoteAsset"]
-                })
-
-        symbols.sort(key=lambda x: x["symbol"])
-        _cache["symbols"] = symbols
-        _cache["timestamp"] = now
-        _cache["last_error"] = None
-        logger.info(f"✅ Total símbolos cargados desde Binance: {len(symbols)}")
-        return symbols
-
-    except Exception as e:
-        logger.error(f"Error obteniendo símbolos: {e}")
-        _cache["last_error"] = str(e)
-        raise
+    _cache["symbols"][exchange] = {"items": items, "timestamp": now}
+    _cache["last_error"][exchange] = None
+    logger.info(f"✅ {exchange}: {len(items)} símbolos")
+    return items
 
 
-def get_instrument(symbol):
-    """Obtiene la info del instrumento. Intenta Bybit, si falla (403), usa Binance."""
-    if symbol in _cache["instruments"]:
-        return _cache["instruments"][symbol]
+def get_instrument(exchange, symbol):
+    """Obtiene info normalizada del instrumento desde el exchange indicado (sin fallback)."""
+    exchange = _normalize_exchange(exchange)
+    symbol = (symbol or "").upper()
+    key = (exchange, symbol)
+    if key in _cache["instruments"]:
+        return _cache["instruments"][key]
 
-    # 1. Intentar Bybit primero
-    try:
-        resp = requests.get(
-            f"{BYBIT_API}/v5/market/instruments-info",
-            params={"category": "linear", "symbol": symbol},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("retCode") == 0 and data["result"]["list"]:
-                _cache["instruments"][symbol] = {"source": "bybit", "data": data["result"]["list"][0]}
-                return _cache["instruments"][symbol]
-    except Exception as e:
-        logger.warning(f"Bybit falló para {symbol}, intentando Binance: {e}")
-
-    # 2. Fallback a Binance
-    try:
-        logger.info(f"Obteniendo datos de {symbol} desde Binance...")
-        resp = requests.get(f"{BINANCE_API}/fapi/v1/exchangeInfo?symbol={symbol}", timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        
-        if "symbols" in data and len(data["symbols"]) > 0:
-            item = data["symbols"][0]
-            # Adaptar formato de Binance al de Bybit para que el cálculo funcione
-            adapted_data = {
-                "symbol": item["symbol"],
-                "baseCoin": item["baseAsset"],
-                "quoteCoin": item["quoteAsset"],
-                "leverageFilter": {"maxLeverage": "125", "leverageStep": "1"}, # Binance permite hasta 125x
-                "lotSizeFilter": {
-                    "qtyStep": str(item["filters"][0].get("stepSize", "0.001")),
-                    "minOrderQty": str(item["filters"][0].get("minQty", "0.001")),
-                    "minNotionalValue": str(item["filters"][3].get("notional", "5"))
-                }
-            }
-            _cache["instruments"][symbol] = {"source": "binance", "data": adapted_data}
-            return _cache["instruments"][symbol]
-    except Exception as e:
-        logger.error(f"Error obteniendo de Binance: {e}")
-        raise
-
-    raise RuntimeError(f"No se pudo obtener información para {symbol}")
+    data = _INSTRUMENT_FETCHERS[exchange](symbol)
+    wrapper = {"source": exchange, "data": data}
+    _cache["instruments"][key] = wrapper
+    return wrapper
 
 
 # ============================================================
@@ -117,35 +291,29 @@ def get_instrument(symbol):
 # ============================================================
 def calcular(entry, sl, margen, instrument_wrapper):
     """Calcula leverage y tamaño de posición."""
-    source = instrument_wrapper["source"]
     inst = instrument_wrapper["data"]
-
-    if source == "bybit":
-        lev_filter = inst["leverageFilter"]
-        lot_filter = inst["lotSizeFilter"]
-        max_lev = float(lev_filter["maxLeverage"])
-        qty_step = float(lot_filter["qtyStep"])
-        min_order_qty = float(lot_filter["minOrderQty"])
-        min_notional = float(lot_filter.get("minNotionalValue") or lot_filter.get("minOrderAmt") or 5)
-        lev_step_str = lev_filter.get("leverageStep", "1")
-    else: # binance
-        max_lev = float(inst["leverageFilter"]["maxLeverage"])
-        qty_step = float(inst["lotSizeFilter"]["qtyStep"])
-        min_order_qty = float(inst["lotSizeFilter"]["minOrderQty"])
-        min_notional = float(inst["lotSizeFilter"]["minNotionalValue"])
-        lev_step_str = "1"
-
-    try:
-        lev_step = float(lev_step_str)
-    except (ValueError, TypeError):
-        lev_step = 1.0
-
-    qty_decimals = max(0, int(-math.log10(qty_step))) if qty_step < 1 else 0
 
     if entry == sl:
         raise ValueError("El precio de entrada no puede ser igual al SL.")
     if entry <= 0 or sl <= 0 or margen <= 0:
         raise ValueError("Todos los valores deben ser positivos.")
+
+    direccion = "LONG" if sl < entry else "SHORT"
+
+    max_lev = float(inst["maxLeverage"])
+    # Leverage específico por dirección (si el exchange lo expone) — BingX no lo trae, usa el genérico.
+    if inst.get("maxLongLeverage") and inst.get("maxShortLeverage"):
+        if direccion == "LONG":
+            max_lev = float(inst["maxLongLeverage"])
+        else:
+            max_lev = float(inst["maxShortLeverage"])
+
+    lev_step = float(inst.get("leverageStep", 1) or 1)
+    qty_step = float(inst["qtyStep"])
+    min_order_qty = float(inst["minOrderQty"])
+    min_notional = float(inst["minNotional"])
+
+    qty_decimals = max(0, int(-math.log10(qty_step))) if qty_step < 1 else 0
 
     distancia = abs(entry - sl) / entry
     if distancia == 0:
@@ -194,7 +362,6 @@ def calcular(entry, sl, margen, instrument_wrapper):
         margen_usado = notional_real / leverage_final
 
     riesgo_real = notional_real * distancia
-    direccion = "LONG" if sl < entry else "SHORT"
 
     return {
         "direccion": direccion,
@@ -210,7 +377,7 @@ def calcular(entry, sl, margen, instrument_wrapper):
         "distancia_sl_pct": round(distancia * 100, 4),
         "min_notional": min_notional,
         "qty_step": qty_step,
-        "data_source": source.upper()
+        "data_source": instrument_wrapper["source"].upper()
     }
 
 
@@ -224,18 +391,20 @@ def index():
 
 @app.route("/api/symbols")
 def api_symbols():
+    exchange = request.args.get("exchange", "binance")
     try:
-        symbols = get_all_symbols()
-        return jsonify({"ok": True, "symbols": symbols, "count": len(symbols)})
+        symbols = get_all_symbols(exchange)
+        return jsonify({"ok": True, "exchange": exchange, "symbols": symbols, "count": len(symbols)})
     except Exception as e:
-        logger.error(f"Error en /api/symbols: {e}", exc_info=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
+        logger.error(f"Error en /api/symbols ({exchange}): {e}", exc_info=True)
+        return jsonify({"ok": False, "exchange": exchange, "error": str(e)}), 500
 
 
 @app.route("/api/instrument/<symbol>")
 def api_instrument(symbol):
+    exchange = request.args.get("exchange", "binance")
     try:
-        wrapper = get_instrument(symbol.upper())
+        wrapper = get_instrument(exchange, symbol)
         inst = wrapper["data"]
         return jsonify({
             "ok": True,
@@ -243,14 +412,15 @@ def api_instrument(symbol):
                 "symbol": inst["symbol"],
                 "baseCoin": inst["baseCoin"],
                 "quoteCoin": inst["quoteCoin"],
-                "maxLeverage": float(inst["leverageFilter"]["maxLeverage"]),
-                "qtyStep": float(inst["lotSizeFilter"]["qtyStep"]),
-                "minOrderQty": float(inst["lotSizeFilter"]["minOrderQty"]),
-                "minNotional": float(inst["lotSizeFilter"]["minNotionalValue"]),
+                "maxLeverage": float(inst["maxLeverage"]),
+                "qtyStep": float(inst["qtyStep"]),
+                "minOrderQty": float(inst["minOrderQty"]),
+                "minNotional": float(inst["minNotional"]),
                 "source": wrapper["source"]
             }
         })
     except Exception as e:
+        logger.error(f"Error en /api/instrument ({exchange}): {e}", exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -258,6 +428,7 @@ def api_instrument(symbol):
 def api_calculate():
     try:
         data = request.get_json()
+        exchange = data.get("exchange", "binance")
         symbol = (data.get("symbol") or "").upper()
         entry = float(data.get("entry", 0))
         sl = float(data.get("sl", 0))
@@ -266,9 +437,10 @@ def api_calculate():
         if entry <= 0 or sl <= 0 or margen <= 0:
             return jsonify({"ok": False, "error": "Todos los valores deben ser positivos."}), 400
 
-        wrapper = get_instrument(symbol)
+        wrapper = get_instrument(exchange, symbol)
         resultado = calcular(entry, sl, margen, wrapper)
         resultado["symbol"] = symbol
+        resultado["exchange"] = exchange
         return jsonify({"ok": True, **resultado})
 
     except ValueError as e:
@@ -287,7 +459,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="theme-color" content="#1a1a2e">
-    <title>Bybit/Binance Futures Calculator</title>
+    <title>Futures Calculator</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/select2-bootstrap-5-theme@1.3.0/dist/select2-bootstrap-5-theme.min.css" rel="stylesheet">
@@ -325,6 +497,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .status-ok { border-left: 3px solid #00c076; }
         .status-error { border-left: 3px solid #f6465d; }
         .status-loading { border-left: 3px solid #f7a600; }
+        .exchange-group { display: flex; gap: 8px; background: rgba(0, 0, 0, 0.25); padding: 6px; border-radius: 12px; }
+        .exchange-btn { flex: 1; padding: 12px; border-radius: 9px; border: 1px solid rgba(255, 255, 255, 0.1); background: transparent; color: #aaa; font-weight: 600; font-size: 15px; cursor: pointer; transition: all 0.2s; }
+        .exchange-btn.active { background: linear-gradient(135deg, #f7a600 0%, #f57600 100%); color: #000; border-color: transparent; }
+        .exchange-btn:not(.active):hover { color: #fff; border-color: rgba(247, 166, 0, 0.5); }
+        .btn-fav { width: 100%; margin-top: 10px; padding: 10px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.15); background: rgba(0, 0, 0, 0.2); color: #ccc; font-weight: 600; font-size: 14px; cursor: pointer; transition: all 0.2s; }
+        .btn-fav:hover { color: #fff; border-color: rgba(247, 166, 0, 0.5); }
+        .btn-fav.active { color: #f7a600; border-color: #f7a600; background: rgba(247, 166, 0, 0.12); }
     </style>
 </head>
 <body>
@@ -333,7 +512,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="col-12 col-lg-8 col-xl-6">
                 <div class="text-center mb-4">
                     <h1 class="fw-bold">⚡ Futures Calculator</h1>
-                    <p class="text-muted mb-0">Calcula leverage y tamaño de posición (Resiliente a bloqueos)</p>
+                    <p class="text-muted mb-0">Calcula leverage y tamaño de posición</p>
                 </div>
 
                 <div id="statusBar" class="status-bar status-loading">
@@ -341,6 +520,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 </div>
 
                 <div class="card-custom">
+                    <div class="mb-3">
+                        <label class="form-label">Exchange</label>
+                        <div class="exchange-group" id="exchangeGroup">
+                            <button type="button" class="exchange-btn active" data-exchange="bybit">Bybit</button>
+                            <button type="button" class="exchange-btn" data-exchange="binance">Binance</button>
+                            <button type="button" class="exchange-btn" data-exchange="bingx">BingX</button>
+                            <button type="button" class="exchange-btn" data-exchange="lbank">LBank</button>
+                        </div>
+                    </div>
+
                     <form id="calcForm">
                         <div class="mb-3">
                             <label class="form-label" for="symbol">Símbolo</label>
@@ -348,6 +537,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                                 <option></option>
                             </select>
                             <div id="symbolInfo" class="info-symbol d-none"></div>
+                            <button type="button" id="btnFav" class="btn-fav" style="display:none;">☆ Marcar como favorito</button>
                         </div>
 
                         <div class="row g-3">
@@ -381,23 +571,126 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
     <script>
         let currentInstrument = null;
+        let currentExchange = 'bybit';
+        let symbolData = [];
+
+        const EXCHANGE_NAMES = { bybit: 'Bybit', binance: 'Binance', bingx: 'BingX', lbank: 'LBank' };
+        const FAV_KEY = 'fut_calc_favs';
+
+        // ---------- Favoritos (localStorage, por exchange) ----------
+        function getFavs() {
+            try { return JSON.parse(localStorage.getItem(FAV_KEY) || '{}'); } catch (e) { return {}; }
+        }
+        function saveFavs(f) { localStorage.setItem(FAV_KEY, JSON.stringify(f)); }
+        function isFav(symbol) { return (getFavs()[currentExchange] || []).indexOf(symbol) !== -1; }
+        function toggleFav(symbol) {
+            const f = getFavs();
+            let list = f[currentExchange] || [];
+            if (list.indexOf(symbol) === -1) list.push(symbol);
+            else list = list.filter(s => s !== symbol);
+            f[currentExchange] = list;
+            saveFavs(f);
+        }
 
         function setStatus(type, message) {
             const bar = $('#statusBar');
             bar.removeClass('status-ok status-error status-loading').addClass('status-' + type).html(message);
         }
 
+        function resetCalc() {
+            $('#result').addClass('d-none');
+            $('#error').addClass('d-none');
+            $('#symbolInfo').addClass('d-none');
+        }
+
+        function updateFavButton() {
+            const sym = $('#symbol').val();
+            const btn = $('#btnFav');
+            if (!sym) { btn.hide(); return; }
+            btn.show();
+            const fav = isFav(sym);
+            btn.text(fav ? '★ Favorito — quitar' : '☆ Marcar como favorito');
+            btn.toggleClass('active', fav);
+        }
+
+        function renderSymbols(restoreVal) {
+            const select = $('#symbol');
+            const saved = (restoreVal !== undefined) ? restoreVal : select.val();
+            const favs = new Set(getFavs()[currentExchange] || []);
+            const favList = symbolData.filter(s => favs.has(s.symbol));
+            const restList = symbolData.filter(s => !favs.has(s.symbol));
+
+            select.select2('destroy');
+            select.empty();
+            select.append($('<option value=""></option>'));
+
+            if (favList.length) {
+                const g = $('<optgroup label="⭐ Favoritos"></optgroup>');
+                favList.forEach(s => g.append(new Option(s.symbol + ' (' + s.baseCoin + '/' + s.quoteCoin + ')', s.symbol)));
+                select.append(g);
+            }
+            if (restList.length) {
+                const g = $('<optgroup label="Todos"></optgroup>');
+                restList.forEach(s => g.append(new Option(s.symbol + ' (' + s.baseCoin + '/' + s.quoteCoin + ')', s.symbol)));
+                select.append(g);
+            }
+
+            select.select2({ theme: 'bootstrap-5', placeholder: 'Busca un símbolo', allowClear: true, width: '100%' });
+
+            if (saved && symbolData.some(s => s.symbol === saved)) {
+                select.val(saved).trigger('change');
+            } else {
+                updateFavButton();
+            }
+        }
+
+        async function loadSymbols() {
+            setStatus('loading', '🔍 Cargando símbolos de ' + EXCHANGE_NAMES[currentExchange] + '...');
+            symbolData = [];
+            currentInstrument = null;
+            resetCalc();
+            try {
+                const resp = await fetch('/api/symbols?exchange=' + currentExchange);
+                const data = await resp.json();
+                if (!data.ok) throw new Error(data.error || 'Error desconocido');
+                symbolData = data.symbols;
+                renderSymbols('');
+                const favCount = (getFavs()[currentExchange] || []).length;
+                setStatus('ok', '✅ ' + EXCHANGE_NAMES[currentExchange] + ' | ' + data.count + ' símbolos disponibles' + (favCount ? ' | ⭐ ' + favCount + ' favoritos' : ''));
+            } catch (e) {
+                console.error('Error cargando símbolos:', e);
+                setStatus('error', '❌ ' + EXCHANGE_NAMES[currentExchange] + ': ' + e.message);
+            }
+        }
+
         $(document).ready(function() {
             $('#symbol').select2({
                 theme: 'bootstrap-5',
-                placeholder: 'Busca un símbolo (ej: BTCUSDT)',
+                placeholder: 'Busca un símbolo',
                 allowClear: true,
                 width: '100%'
             });
 
+            $('#exchangeGroup .exchange-btn').on('click', function() {
+                const ex = $(this).data('exchange');
+                if (ex === currentExchange) return;
+                currentExchange = ex;
+                $('#exchangeGroup .exchange-btn').removeClass('active');
+                $(this).addClass('active');
+                loadSymbols();
+            });
+
             loadSymbols();
 
+            $('#btnFav').on('click', function() {
+                const sym = $('#symbol').val();
+                if (!sym) return;
+                toggleFav(sym);
+                renderSymbols(sym);
+            });
+
             $('#symbol').on('change', async function() {
+                updateFavButton();
                 const symbol = $(this).val();
                 if (!symbol) {
                     $('#symbolInfo').addClass('d-none');
@@ -405,12 +698,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     return;
                 }
                 try {
-                    const resp = await fetch('/api/instrument/' + symbol);
+                    const resp = await fetch('/api/instrument/' + symbol + '?exchange=' + currentExchange);
                     const data = await resp.json();
                     if (data.ok) {
                         currentInstrument = data.info;
                         const info = data.info;
-                        const sourceBadge = info.source === 'binance' ? '<span class="badge badge-info">Datos de Binance (Bybit bloqueado)</span>' : '<span class="badge badge-ok">Bybit</span>';
+                        const sourceBadge = '<span class="badge badge-info">' + (EXCHANGE_NAMES[info.source] || info.source) + '</span>';
                         $('#symbolInfo').html(
                             '<strong>' + info.symbol + '</strong> ' + sourceBadge + '<br>' +
                             'Max Leverage: <span class="text-warning">' + info.maxLeverage + 'x</span> | ' +
@@ -435,6 +728,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
                 try {
                     const payload = {
+                        exchange: currentExchange,
                         symbol: $('#symbol').val(),
                         entry: parseFloat($('#entry').val()),
                         sl: parseFloat($('#sl').val()),
@@ -455,7 +749,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     const dirBadge = data.direccion === 'LONG' ? '<span class="badge badge-long">LONG</span>' : '<span class="badge badge-short">SHORT</span>';
                     const warnLev = data.leverage_teorico > data.max_leverage_simbolo ? '<span class="badge badge-warn ms-2">Limitado</span>' : '';
                     const margenBadge = data.leverage_limitado ? '<span class="badge badge-warn">⚠ Limitado</span>' : '<span class="badge badge-ok">✓ Exacto</span>';
-                    const sourceBadge = data.data_source === 'BINANCE' ? '<span class="badge badge-info">Usando datos de Binance</span>' : '';
+                    const sourceBadge = '<span class="badge badge-info">' + (EXCHANGE_NAMES[data.exchange] || data.exchange) + '</span>';
 
                     resultBox.html(
                         '<h5 class="mb-3">' + dirBadge + ' ' + data.symbol + ' ' + warnLev + ' ' + sourceBadge + '</h5>' +
@@ -478,33 +772,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 }
             });
         });
-
-        async function loadSymbols() {
-            try {
-                setStatus('loading', '🔍 Cargando símbolos...');
-                const resp = await fetch('/api/symbols');
-                const data = await resp.json();
-
-                if (!data.ok) throw new Error(data.error || 'Error desconocido');
-
-                const select = $('#symbol');
-                data.symbols.forEach(s => {
-                    select.append(new Option(s.symbol + ' (' + s.baseCoin + '/' + s.quoteCoin + ')', s.symbol));
-                });
-
-                setStatus('ok', '✅ Conectado | ' + data.count + ' símbolos disponibles');
-            } catch (e) {
-                console.error('Error cargando símbolos:', e);
-                setStatus('error', '❌ Error: ' + e.message);
-            }
-        }
     </script>
 </body>
 </html>'''
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Futures Calculator (Render-Resilient)")
-    print("  http://localhost:5000")
+    print("  Futures Calculator (Bybit / Binance / BingX)")
+    print("  http://localhost:8000")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=8000, debug=True)
