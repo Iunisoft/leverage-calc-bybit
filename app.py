@@ -1,6 +1,6 @@
 """
-Bybit Perpetual Futures Calculator
-Aplicación web responsiva en un solo archivo.
+Bybit/Binance Perpetual Futures Calculator
+Resiliente a bloqueos de IP en Render.
 """
 
 from flask import Flask, render_template_string, request, jsonify
@@ -9,20 +9,15 @@ import time
 import math
 import logging
 
-# Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
 BYBIT_API = "https://api.bybit.com"
-CACHE_TTL = 3600  # 1 hora
-REQUEST_TIMEOUT = 20  # segundos
+BINANCE_API = "https://fapi.binance.com"
+CACHE_TTL = 3600
 
-# Caché simple en memoria
 _cache = {
     "symbols": None,
     "timestamp": 0,
@@ -30,126 +25,116 @@ _cache = {
     "last_error": None
 }
 
-
 # ============================================================
-# API BYBIT
+# API FUNCTIONS
 # ============================================================
 def get_all_symbols():
-    """Obtiene todos los símbolos de futuros lineales (USDT perpetuos)."""
+    """Obtiene símbolos de futuros USDT perpetuos desde Binance (más permisivo con Render)."""
     now = time.time()
     if _cache["symbols"] and (now - _cache["timestamp"]) < CACHE_TTL:
-        logger.info(f"Retornando {len(_cache['symbols'])} símbolos desde caché")
         return _cache["symbols"]
 
-    logger.info("Consultando API de Bybit para obtener símbolos...")
-    symbols = []
-    cursor = ""
-    intentos = 0
-    max_intentos = 3
+    logger.info("Consultando API de Binance para obtener símbolos...")
+    try:
+        resp = requests.get(f"{BINANCE_API}/fapi/v1/exchangeInfo", timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
 
-    while intentos < max_intentos:
-        try:
-            params = {"category": "linear", "limit": "1000"}
-            if cursor:
-                params["cursor"] = cursor
-
-            resp = requests.get(
-                f"{BYBIT_API}/v5/market/instruments-info",
-                params=params,
-                timeout=REQUEST_TIMEOUT
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            if data.get("retCode") != 0:
-                error_msg = f"Bybit error: {data.get('retMsg')} (code: {data.get('retCode')})"
-                logger.error(error_msg)
-                _cache["last_error"] = error_msg
-                raise RuntimeError(error_msg)
-
-            items = data["result"]["list"]
-            logger.info(f"Página recibida: {len(items)} instrumentos")
-
-            for item in items:
+        symbols = []
+        for item in data.get("symbols", []):
+            if item.get("contractType") == "PERPETUAL" and item.get("quoteAsset") == "USDT":
                 symbols.append({
                     "symbol": item["symbol"],
-                    "baseCoin": item["baseCoin"],
-                    "quoteCoin": item["quoteCoin"]
+                    "baseCoin": item["baseAsset"],
+                    "quoteCoin": item["quoteAsset"]
                 })
 
-            cursor = data["result"].get("nextPageCursor", "")
-            if not cursor:
-                break
+        symbols.sort(key=lambda x: x["symbol"])
+        _cache["symbols"] = symbols
+        _cache["timestamp"] = now
+        _cache["last_error"] = None
+        logger.info(f"✅ Total símbolos cargados desde Binance: {len(symbols)}")
+        return symbols
 
-            intentos = 0
-            time.sleep(0.5)
-
-        except requests.exceptions.Timeout:
-            intentos += 1
-            logger.warning(f"Timeout en intento {intentos}/{max_intentos}")
-            if intentos >= max_intentos:
-                raise
-            time.sleep(2)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error de red: {e}")
-            _cache["last_error"] = str(e)
-            raise
-
-    symbols.sort(key=lambda x: x["symbol"])
-    _cache["symbols"] = symbols
-    _cache["timestamp"] = now
-    _cache["last_error"] = None
-    logger.info(f"✅ Total símbolos cargados: {len(symbols)}")
-    return symbols
+    except Exception as e:
+        logger.error(f"Error obteniendo símbolos: {e}")
+        _cache["last_error"] = str(e)
+        raise
 
 
 def get_instrument(symbol):
-    """Obtiene la info completa de un instrumento."""
+    """Obtiene la info del instrumento. Intenta Bybit, si falla (403), usa Binance."""
     if symbol in _cache["instruments"]:
         return _cache["instruments"][symbol]
 
-    logger.info(f"Consultando instrumento: {symbol}")
+    # 1. Intentar Bybit primero
     try:
         resp = requests.get(
             f"{BYBIT_API}/v5/market/instruments-info",
             params={"category": "linear", "symbol": symbol},
-            timeout=REQUEST_TIMEOUT
+            timeout=10
         )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("retCode") == 0 and data["result"]["list"]:
+                _cache["instruments"][symbol] = {"source": "bybit", "data": data["result"]["list"][0]}
+                return _cache["instruments"][symbol]
+    except Exception as e:
+        logger.warning(f"Bybit falló para {symbol}, intentando Binance: {e}")
+
+    # 2. Fallback a Binance
+    try:
+        logger.info(f"Obteniendo datos de {symbol} desde Binance...")
+        resp = requests.get(f"{BINANCE_API}/fapi/v1/exchangeInfo?symbol={symbol}", timeout=10)
         resp.raise_for_status()
         data = resp.json()
-
-        if data.get("retCode") != 0:
-            raise RuntimeError(f"Bybit error: {data.get('retMsg')}")
-
-        items = data["result"]["list"]
-        if not items:
-            return None
-
-        _cache["instruments"][symbol] = items[0]
-        return items[0]
+        
+        if "symbols" in data and len(data["symbols"]) > 0:
+            item = data["symbols"][0]
+            # Adaptar formato de Binance al de Bybit para que el cálculo funcione
+            adapted_data = {
+                "symbol": item["symbol"],
+                "baseCoin": item["baseAsset"],
+                "quoteCoin": item["quoteAsset"],
+                "leverageFilter": {"maxLeverage": "125", "leverageStep": "1"}, # Binance permite hasta 125x
+                "lotSizeFilter": {
+                    "qtyStep": str(item["filters"][0].get("stepSize", "0.001")),
+                    "minOrderQty": str(item["filters"][0].get("minQty", "0.001")),
+                    "minNotionalValue": str(item["filters"][3].get("notional", "5"))
+                }
+            }
+            _cache["instruments"][symbol] = {"source": "binance", "data": adapted_data}
+            return _cache["instruments"][symbol]
     except Exception as e:
-        logger.error(f"Error obteniendo {symbol}: {e}")
+        logger.error(f"Error obteniendo de Binance: {e}")
         raise
+
+    raise RuntimeError(f"No se pudo obtener información para {symbol}")
 
 
 # ============================================================
 # CÁLCULO
 # ============================================================
-def calcular(entry, sl, margen, instrument):
+def calcular(entry, sl, margen, instrument_wrapper):
     """Calcula leverage y tamaño de posición."""
-    lev_filter = instrument["leverageFilter"]
-    lot_filter = instrument["lotSizeFilter"]
+    source = instrument_wrapper["source"]
+    inst = instrument_wrapper["data"]
 
-    max_lev = float(lev_filter["maxLeverage"])
-    qty_step = float(lot_filter["qtyStep"])
-    min_order_qty = float(lot_filter["minOrderQty"])
-    min_notional = float(
-        lot_filter.get("minNotionalValue")
-        or lot_filter.get("minOrderAmt")
-        or 0
-    )
+    if source == "bybit":
+        lev_filter = inst["leverageFilter"]
+        lot_filter = inst["lotSizeFilter"]
+        max_lev = float(lev_filter["maxLeverage"])
+        qty_step = float(lot_filter["qtyStep"])
+        min_order_qty = float(lot_filter["minOrderQty"])
+        min_notional = float(lot_filter.get("minNotionalValue") or lot_filter.get("minOrderAmt") or 5)
+        lev_step_str = lev_filter.get("leverageStep", "1")
+    else: # binance
+        max_lev = float(inst["leverageFilter"]["maxLeverage"])
+        qty_step = float(inst["lotSizeFilter"]["qtyStep"])
+        min_order_qty = float(inst["lotSizeFilter"]["minOrderQty"])
+        min_notional = float(inst["lotSizeFilter"]["minNotionalValue"])
+        lev_step_str = "1"
 
-    lev_step_str = lev_filter.get("leverageStep", "1")
     try:
         lev_step = float(lev_step_str)
     except (ValueError, TypeError):
@@ -178,18 +163,12 @@ def calcular(entry, sl, margen, instrument):
     qty_ajustada = round(qty_ajustada, qty_decimals)
 
     if qty_ajustada < min_order_qty:
-        raise ValueError(
-            f"La cantidad ajustada ({qty_ajustada}) es menor que el mínimo "
-            f"permitido ({min_order_qty}). Aumenta el margen."
-        )
+        raise ValueError(f"La cantidad ajustada ({qty_ajustada}) es menor que el mínimo permitido ({min_order_qty}). Aumenta el margen.")
 
     notional_real = qty_ajustada * entry
 
     if min_notional > 0 and notional_real < min_notional:
-        raise ValueError(
-            f"El notional ({notional_real:.2f} USDT) es menor que el mínimo "
-            f"permitido ({min_notional} USDT). Aumenta el margen."
-        )
+        raise ValueError(f"El notional ({notional_real:.2f} USDT) es menor que el mínimo permitido ({min_notional} USDT). Aumenta el margen.")
 
     leverage_necesario = notional_real / margen
     leverage_final = round(leverage_necesario / lev_step) * lev_step
@@ -208,15 +187,9 @@ def calcular(entry, sl, margen, instrument):
         notional_real = qty_ajustada * entry
 
         if qty_ajustada < min_order_qty:
-            raise ValueError(
-                f"La cantidad ajustada ({qty_ajustada}) es menor que el mínimo "
-                f"permitido ({min_order_qty}). Aumenta el margen."
-            )
+            raise ValueError(f"La cantidad ajustada ({qty_ajustada}) es menor que el mínimo permitido ({min_order_qty}). Aumenta el margen.")
         if min_notional > 0 and notional_real < min_notional:
-            raise ValueError(
-                f"El notional ({notional_real:.2f} USDT) es menor que el mínimo "
-                f"permitido ({min_notional} USDT). Aumenta el margen."
-            )
+            raise ValueError(f"El notional ({notional_real:.2f} USDT) es menor que el mínimo permitido ({min_notional} USDT). Aumenta el margen.")
 
         margen_usado = notional_real / leverage_final
 
@@ -236,7 +209,8 @@ def calcular(entry, sl, margen, instrument):
         "riesgo_real_usdt": round(riesgo_real, 2),
         "distancia_sl_pct": round(distancia * 100, 4),
         "min_notional": min_notional,
-        "qty_step": qty_step
+        "qty_step": qty_step,
+        "data_source": source.upper()
     }
 
 
@@ -248,98 +222,35 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
-@app.route("/api/health")
-def api_health():
-    """Endpoint de diagnóstico."""
-    symbols_count = len(_cache["symbols"]) if _cache["symbols"] else 0
-    return jsonify({
-        "ok": True,
-        "status": "running",
-        "cached_symbols": symbols_count,
-        "last_error": _cache["last_error"],
-        "cache_age_seconds": int(time.time() - _cache["timestamp"]) if _cache["timestamp"] else None
-    })
-
-
-@app.route("/api/test-bybit")
-def api_test_bybit():
-    """Fuerza una llamada a Bybit para diagnosticar."""
-    try:
-        logger.info("=== TEST BYBIT INICIADO ===")
-        resp = requests.get(
-            f"{BYBIT_API}/v5/market/instruments-info",
-            params={"category": "linear", "limit": "10"},
-            timeout=30
-        )
-        logger.info(f"Status code: {resp.status_code}")
-
-        data = resp.json()
-        logger.info(f"retCode: {data.get('retCode')}")
-
-        items = data.get("result", {}).get("list", [])
-        logger.info(f"Items recibidos: {len(items)}")
-
-        return jsonify({
-            "ok": True,
-            "status_code": resp.status_code,
-            "retCode": data.get("retCode"),
-            "retMsg": data.get("retMsg"),
-            "items_count": len(items),
-            "first_item": items[0] if items else None
-        })
-    except requests.exceptions.Timeout as e:
-        logger.error(f"TIMEOUT: {e}")
-        return jsonify({"ok": False, "error": "TIMEOUT", "details": str(e)}), 500
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"CONNECTION ERROR: {e}")
-        return jsonify({"ok": False, "error": "CONNECTION_ERROR", "details": str(e)}), 500
-    except Exception as e:
-        logger.error(f"OTHER ERROR: {e}", exc_info=True)
-        return jsonify({"ok": False, "error": "OTHER", "details": str(e), "type": type(e).__name__}), 500
-
-
 @app.route("/api/symbols")
 def api_symbols():
     try:
-        logger.info("Endpoint /api/symbols llamado")
         symbols = get_all_symbols()
-        logger.info(f"Retornando {len(symbols)} símbolos")
         return jsonify({"ok": True, "symbols": symbols, "count": len(symbols)})
     except Exception as e:
         logger.error(f"Error en /api/symbols: {e}", exc_info=True)
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-            "type": type(e).__name__
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/instrument/<symbol>")
 def api_instrument(symbol):
     try:
-        inst = get_instrument(symbol.upper())
-        if not inst:
-            return jsonify({"ok": False, "error": "Símbolo no encontrado"}), 404
-
-        lev_filter = inst["leverageFilter"]
-        lot_filter = inst["lotSizeFilter"]
-
+        wrapper = get_instrument(symbol.upper())
+        inst = wrapper["data"]
         return jsonify({
             "ok": True,
             "info": {
                 "symbol": inst["symbol"],
                 "baseCoin": inst["baseCoin"],
                 "quoteCoin": inst["quoteCoin"],
-                "maxLeverage": float(lev_filter["maxLeverage"]),
-                "leverageStep": lev_filter.get("leverageStep", "1"),
-                "qtyStep": float(lot_filter["qtyStep"]),
-                "minOrderQty": float(lot_filter["minOrderQty"]),
-                "minNotional": float(lot_filter.get("minNotionalValue")
-                                     or lot_filter.get("minOrderAmt") or 0)
+                "maxLeverage": float(inst["leverageFilter"]["maxLeverage"]),
+                "qtyStep": float(inst["lotSizeFilter"]["qtyStep"]),
+                "minOrderQty": float(inst["lotSizeFilter"]["minOrderQty"]),
+                "minNotional": float(inst["lotSizeFilter"]["minNotionalValue"]),
+                "source": wrapper["source"]
             }
         })
     except Exception as e:
-        logger.error(f"Error en /api/instrument: {e}", exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -355,11 +266,8 @@ def api_calculate():
         if entry <= 0 or sl <= 0 or margen <= 0:
             return jsonify({"ok": False, "error": "Todos los valores deben ser positivos."}), 400
 
-        inst = get_instrument(symbol)
-        if not inst:
-            return jsonify({"ok": False, "error": f"Símbolo {symbol} no encontrado."}), 404
-
-        resultado = calcular(entry, sl, margen, inst)
+        wrapper = get_instrument(symbol)
+        resultado = calcular(entry, sl, margen, wrapper)
         resultado["symbol"] = symbol
         return jsonify({"ok": True, **resultado})
 
@@ -371,7 +279,7 @@ def api_calculate():
 
 
 # ============================================================
-# HTML TEMPLATE - USANDO COMILLAS TRIPLES SIMPLES
+# HTML TEMPLATE
 # ============================================================
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html lang="es">
@@ -379,123 +287,41 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="theme-color" content="#1a1a2e">
-    <title>Bybit Futures Calculator</title>
-
+    <title>Bybit/Binance Futures Calculator</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/select2-bootstrap-5-theme@1.3.0/dist/select2-bootstrap-5-theme.min.css" rel="stylesheet">
-
     <style>
         * { box-sizing: border-box; }
-        body {
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            color: #e4e4e4;
-            min-height: 100vh;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            margin: 0;
-            padding: 0;
-        }
+        body { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #e4e4e4; min-height: 100vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 0; }
         .container { padding: 15px; }
         @media (min-width: 768px) { .container { padding: 30px; } }
-        .card-custom {
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 16px;
-            padding: 20px;
-        }
+        .card-custom { background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); border-radius: 16px; padding: 20px; }
         @media (min-width: 768px) { .card-custom { padding: 30px; } }
-        .form-control, .select2-container--bootstrap-5 .select2-selection {
-            background: rgba(0, 0, 0, 0.3) !important;
-            border: 1px solid rgba(255, 255, 255, 0.15) !important;
-            color: #fff !important;
-            font-size: 16px !important;
-            min-height: 48px;
-        }
-        .form-control:focus {
-            border-color: #f7a600 !important;
-            box-shadow: 0 0 0 0.2rem rgba(247, 166, 0, 0.25) !important;
-        }
+        .form-control, .select2-container--bootstrap-5 .select2-selection { background: rgba(0, 0, 0, 0.3) !important; border: 1px solid rgba(255, 255, 255, 0.15) !important; color: #fff !important; font-size: 16px !important; min-height: 48px; }
+        .form-control:focus { border-color: #f7a600 !important; box-shadow: 0 0 0 0.2rem rgba(247, 166, 0, 0.25) !important; }
         .form-label { font-size: 14px; font-weight: 500; margin-bottom: 8px; color: #ccc; }
-        .btn-calc {
-            background: linear-gradient(135deg, #f7a600 0%, #f57600 100%);
-            border: none;
-            color: #000;
-            font-weight: 600;
-            padding: 14px;
-            border-radius: 10px;
-            font-size: 16px;
-            min-height: 48px;
-            width: 100%;
-        }
-        .result-box {
-            background: rgba(0, 0, 0, 0.3);
-            border-radius: 12px;
-            padding: 15px;
-            margin-top: 20px;
-        }
-        .result-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 12px 0;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-            flex-wrap: wrap;
-            gap: 8px;
-        }
+        .btn-calc { background: linear-gradient(135deg, #f7a600 0%, #f57600 100%); border: none; color: #000; font-weight: 600; padding: 14px; border-radius: 10px; font-size: 16px; min-height: 48px; width: 100%; }
+        .result-box { background: rgba(0, 0, 0, 0.3); border-radius: 12px; padding: 15px; margin-top: 20px; }
+        .result-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05); flex-wrap: wrap; gap: 8px; }
         .result-item:last-child { border-bottom: none; }
         .result-label { color: #aaa; font-size: 13px; flex: 1; min-width: 120px; }
-        .result-value {
-            color: #f7a600;
-            font-weight: 600;
-            font-family: "SF Mono", Monaco, monospace;
-            text-align: right;
-            font-size: 14px;
-        }
+        .result-value { color: #f7a600; font-weight: 600; font-family: "SF Mono", Monaco, monospace; text-align: right; font-size: 14px; }
         .badge-long { background: #00c076; color: #fff; }
         .badge-short { background: #f6465d; color: #fff; }
         .badge-warn { background: #f7a600; color: #000; }
         .badge-ok { background: #00c076; color: #fff; }
+        .badge-info { background: #0d6efd; color: #fff; font-size: 10px; }
         h1 { color: #f7a600; font-size: 24px; margin-bottom: 10px; }
         @media (min-width: 768px) { h1 { font-size: 36px; } }
         .select2-dropdown { background: #1a1a2e !important; border: 1px solid rgba(255, 255, 255, 0.15) !important; }
         .select2-results__option { color: #e4e4e4 !important; padding: 12px !important; }
         .select2-results__option--highlighted { background: #f7a600 !important; color: #000 !important; }
-        .select2-search__field {
-            background: #16213e !important;
-            color: #fff !important;
-            font-size: 16px !important;
-        }
-        .info-symbol {
-            font-size: 12px;
-            color: #aaa;
-            background: rgba(0,0,0,0.2);
-            padding: 12px;
-            border-radius: 8px;
-            margin-top: 10px;
-        }
-        .highlight-margen {
-            background: rgba(0, 192, 118, 0.1);
-            border-left: 3px solid #00c076;
-            padding: 12px;
-            margin-bottom: 15px;
-            border-radius: 6px;
-        }
-        .alert-danger {
-            background: rgba(246, 70, 93, 0.2);
-            border: 1px solid #f6465d;
-            color: #f6465d;
-            padding: 12px;
-            border-radius: 8px;
-        }
-        .status-bar {
-            background: rgba(0,0,0,0.3);
-            padding: 8px 12px;
-            border-radius: 8px;
-            font-size: 12px;
-            margin-bottom: 15px;
-            word-break: break-word;
-        }
+        .select2-search__field { background: #16213e !important; color: #fff !important; font-size: 16px !important; }
+        .info-symbol { font-size: 12px; color: #aaa; background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px; margin-top: 10px; }
+        .highlight-margen { background: rgba(0, 192, 118, 0.1); border-left: 3px solid #00c076; padding: 12px; margin-bottom: 15px; border-radius: 6px; }
+        .alert-danger { background: rgba(246, 70, 93, 0.2); border: 1px solid #f6465d; color: #f6465d; padding: 12px; border-radius: 8px; }
+        .status-bar { background: rgba(0,0,0,0.3); padding: 8px 12px; border-radius: 8px; font-size: 12px; margin-bottom: 15px; word-break: break-word; }
         .status-ok { border-left: 3px solid #00c076; }
         .status-error { border-left: 3px solid #f6465d; }
         .status-loading { border-left: 3px solid #f7a600; }
@@ -506,12 +332,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         <div class="row justify-content-center">
             <div class="col-12 col-lg-8 col-xl-6">
                 <div class="text-center mb-4">
-                    <h1 class="fw-bold">⚡ Bybit Futures Calculator</h1>
-                    <p class="text-muted mb-0">Calcula leverage y tamaño de posición</p>
+                    <h1 class="fw-bold">⚡ Futures Calculator</h1>
+                    <p class="text-muted mb-0">Calcula leverage y tamaño de posición (Resiliente a bloqueos)</p>
                 </div>
 
                 <div id="statusBar" class="status-bar status-loading">
-                    🔍 Verificando conexión con Bybit...
+                    🔍 Cargando símbolos...
                 </div>
 
                 <div class="card-custom">
@@ -539,9 +365,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                             </div>
                         </div>
 
-                        <button type="submit" class="btn btn-calc mt-4" id="btnCalc">
-                            Calcular
-                        </button>
+                        <button type="submit" class="btn btn-calc mt-4" id="btnCalc">Calcular</button>
                     </form>
 
                     <div id="result" class="result-box d-none"></div>
@@ -560,9 +384,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         function setStatus(type, message) {
             const bar = $('#statusBar');
-            bar.removeClass('status-ok status-error status-loading')
-               .addClass('status-' + type)
-               .html(message);
+            bar.removeClass('status-ok status-error status-loading').addClass('status-' + type).html(message);
         }
 
         $(document).ready(function() {
@@ -588,11 +410,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     if (data.ok) {
                         currentInstrument = data.info;
                         const info = data.info;
+                        const sourceBadge = info.source === 'binance' ? '<span class="badge badge-info">Datos de Binance (Bybit bloqueado)</span>' : '<span class="badge badge-ok">Bybit</span>';
                         $('#symbolInfo').html(
-                            '<strong>' + info.symbol + '</strong><br>' +
+                            '<strong>' + info.symbol + '</strong> ' + sourceBadge + '<br>' +
                             'Max Leverage: <span class="text-warning">' + info.maxLeverage + 'x</span> | ' +
                             'Qty Step: ' + info.qtyStep + ' | ' +
-                            'Min Qty: ' + info.minOrderQty + ' | ' +
                             'Min Notional: ' + info.minNotional + ' USDT'
                         ).removeClass('d-none');
                     }
@@ -630,29 +452,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
                     if (!data.ok) throw new Error(data.error);
 
-                    const dirBadge = data.direccion === 'LONG'
-                        ? '<span class="badge badge-long">LONG</span>'
-                        : '<span class="badge badge-short">SHORT</span>';
-
-                    const warnLev = data.leverage_teorico > data.max_leverage_simbolo
-                        ? '<span class="badge badge-warn ms-2">Limitado</span>'
-                        : '';
-
-                    const margenBadge = data.leverage_limitado
-                        ? '<span class="badge badge-warn">⚠ Limitado</span>'
-                        : '<span class="badge badge-ok">✓ Exacto</span>';
+                    const dirBadge = data.direccion === 'LONG' ? '<span class="badge badge-long">LONG</span>' : '<span class="badge badge-short">SHORT</span>';
+                    const warnLev = data.leverage_teorico > data.max_leverage_simbolo ? '<span class="badge badge-warn ms-2">Limitado</span>' : '';
+                    const margenBadge = data.leverage_limitado ? '<span class="badge badge-warn">⚠ Limitado</span>' : '<span class="badge badge-ok">✓ Exacto</span>';
+                    const sourceBadge = data.data_source === 'BINANCE' ? '<span class="badge badge-info">Usando datos de Binance</span>' : '';
 
                     resultBox.html(
-                        '<h5 class="mb-3">' + dirBadge + ' ' + data.symbol + ' ' + warnLev + '</h5>' +
+                        '<h5 class="mb-3">' + dirBadge + ' ' + data.symbol + ' ' + warnLev + ' ' + sourceBadge + '</h5>' +
                         '<div class="highlight-margen">' +
-                            '<div class="result-item">' +
-                                '<span class="result-label">Margen solicitado</span>' +
-                                '<span class="result-value">' + data.margen_solicitado.toFixed(2) + ' USDT</span>' +
-                            '</div>' +
-                            '<div class="result-item">' +
-                                '<span class="result-label">Margen usado</span>' +
-                                '<span class="result-value">' + data.margen_usado.toFixed(2) + ' USDT ' + margenBadge + '</span>' +
-                            '</div>' +
+                            '<div class="result-item"><span class="result-label">Margen solicitado</span><span class="result-value">' + data.margen_solicitado.toFixed(2) + ' USDT</span></div>' +
+                            '<div class="result-item"><span class="result-label">Margen usado</span><span class="result-value">' + data.margen_usado.toFixed(2) + ' USDT ' + margenBadge + '</span></div>' +
                         '</div>' +
                         '<div class="result-item"><span class="result-label">Leverage teórico</span><span class="result-value">' + data.leverage_teorico + 'x</span></div>' +
                         '<div class="result-item"><span class="result-label">Leverage aplicado</span><span class="result-value">' + data.leverage_final + 'x</span></div>' +
@@ -672,41 +481,30 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         async function loadSymbols() {
             try {
-                setStatus('loading', '🔍 Cargando símbolos desde Bybit... (puede tardar 10-30s la primera vez)');
+                setStatus('loading', '🔍 Cargando símbolos...');
                 const resp = await fetch('/api/symbols');
                 const data = await resp.json();
 
-                if (!data.ok) {
-                    throw new Error(data.error || 'Error desconocido');
-                }
+                if (!data.ok) throw new Error(data.error || 'Error desconocido');
 
                 const select = $('#symbol');
                 data.symbols.forEach(s => {
-                    select.append(new Option(
-                        s.symbol + ' (' + s.baseCoin + '/' + s.quoteCoin + ')',
-                        s.symbol
-                    ));
+                    select.append(new Option(s.symbol + ' (' + s.baseCoin + '/' + s.quoteCoin + ')', s.symbol));
                 });
 
-                setStatus('ok', '✅ Conectado con Bybit | ' + data.count + ' símbolos disponibles');
-                console.log('Símbolos cargados:', data.count);
-
+                setStatus('ok', '✅ Conectado | ' + data.count + ' símbolos disponibles');
             } catch (e) {
                 console.error('Error cargando símbolos:', e);
-                setStatus('error', '❌ Error: ' + e.message + ' | Prueba: /api/test-bybit');
+                setStatus('error', '❌ Error: ' + e.message);
             }
         }
     </script>
 </body>
 </html>'''
 
-
-# ============================================================
-# MAIN
-# ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Bybit Futures Calculator")
+    print("  Futures Calculator (Render-Resilient)")
     print("  http://localhost:5000")
     print("=" * 60)
     app.run(host="0.0.0.0", port=5000, debug=True)
