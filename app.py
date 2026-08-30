@@ -1,9 +1,11 @@
+
 """
 Bybit/Binance/BingX Perpetual Futures Calculator
 Calcula leverage y tamaño de posición. Exchange seleccionable, sin fallback entre exchanges.
 """
 
 from flask import Flask, render_template_string, request, jsonify
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import requests
 import time
 import math
@@ -289,8 +291,39 @@ def get_instrument(exchange, symbol):
 # ============================================================
 # CÁLCULO
 # ============================================================
+def _step_decimals(step):
+    """Decimales del paso (para formatear la cantidad) sin errores de punto flotante."""
+    try:
+        d = Decimal(str(step)).normalize()
+        exp = d.as_tuple().exponent
+        return max(0, -exp) if exp < 0 else 0
+    except Exception:
+        return 6
+
+
+def _round_down(value, step):
+    """Redondea hacia abajo al múltiplo exacto de `step`, sin errores de float."""
+    if step <= 0 or value <= 0:
+        return float(value)
+    d = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step))
+    return float(d)
+
+
+def _round_up(value, step):
+    """Redondea hacia arriba al múltiplo exacto de `step`, sin errores de float."""
+    if step <= 0:
+        return float(value)
+    d = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_UP) * Decimal(str(step))
+    return float(d)
+
+
 def calcular(entry, sl, margen, instrument_wrapper):
-    """Calcula leverage y tamaño de posición."""
+    """Calcula leverage y tamaño de posición.
+
+    La idea es arriesgar el margen: si el leverage que sugiere el riesgo (0.70/distancia)
+    no alcanza el mínimo del símbolo, el leverage sube (hasta el máximo de la exchange)
+    para que la posición quepa. Si ni con el máximo cabe, entonces sí falla.
+    """
     inst = instrument_wrapper["data"]
 
     if entry == sl:
@@ -312,71 +345,100 @@ def calcular(entry, sl, margen, instrument_wrapper):
     qty_step = float(inst["qtyStep"])
     min_order_qty = float(inst["minOrderQty"])
     min_notional = float(inst["minNotional"])
-
-    qty_decimals = max(0, int(-math.log10(qty_step))) if qty_step < 1 else 0
+    base_coin = inst.get("baseCoin", "")
 
     distancia = abs(entry - sl) / entry
     if distancia == 0:
         raise ValueError("Distancia al SL inválida.")
 
     leverage_teorico = 0.70 / distancia
-    leverage_capped = min(leverage_teorico, max_lev)
-    leverage_set = math.floor(leverage_capped / lev_step) * lev_step
-    leverage_set = round(leverage_set, 10)
 
-    notional_inicial = margen * leverage_set
-    qty_inicial = notional_inicial / entry
+    def build(lev):
+        qty_raw = (margen * lev) / entry
+        qty = _round_down(qty_raw, qty_step)
+        notional = qty * entry
+        return qty, notional
 
-    qty_ajustada = math.floor(qty_inicial / qty_step) * qty_step
-    qty_ajustada = round(qty_ajustada, qty_decimals)
+    def fits(qty, notional):
+        return (qty >= min_order_qty - 1e-12 and
+                notional >= min_notional - 1e-12)
 
-    if qty_ajustada < min_order_qty:
-        raise ValueError(f"La cantidad ajustada ({qty_ajustada}) es menor que el mínimo permitido ({min_order_qty}). Aumenta el margen.")
+    # Leverage mínimo necesario para cumplir el mínimo de orden / notional (con la precisión del step)
+    min_qty_needed = max(min_order_qty, (min_notional / entry) if min_notional > 0 else 0)
+    min_qty_mult = _round_up(min_qty_needed, qty_step) if min_qty_needed > 0 else 0
+    lev_min_fit = _round_up((min_qty_mult * entry) / margen, lev_step) if min_qty_mult > 0 else 0
 
-    notional_real = qty_ajustada * entry
+    # Leverage ideal según riesgo (floor al step), limitado al máximo del símbolo
+    lev_risk = _round_down(min(leverage_teorico, max_lev), lev_step)
 
-    if min_notional > 0 and notional_real < min_notional:
-        raise ValueError(f"El notional ({notional_real:.2f} USDT) es menor que el mínimo permitido ({min_notional} USDT). Aumenta el margen.")
+    # Usar el leverage de riesgo; si no alcanza el mínimo, subir hasta caber (sin pasar el máximo)
+    lev_final = max(lev_risk, lev_min_fit)
+    subido_min = lev_final > lev_risk + 1e-9
 
-    leverage_necesario = notional_real / margen
-    leverage_final = round(leverage_necesario / lev_step) * lev_step
-    leverage_final = round(leverage_final, 10)
-
-    leverage_limitado = False
-    margen_usado = margen
-
-    if leverage_final > max_lev:
+    if lev_final > max_lev + 1e-9:
+        # Necesitaría más leverage del permitido → verificar si con el máximo cabe
+        lev_final = max_lev
+        qty, notional = build(lev_final)
+        if not fits(qty, notional):
+            raise ValueError(
+                f"No se puede abrir: el mínimo del símbolo ({min_order_qty} {base_coin}, "
+                f"≈{min_order_qty*entry:.2f} USDT) no cabe con {margen} USDT ni al máximo "
+                f"{max_lev:.0f}x. Aumenta el margen o acorta el SL."
+            )
         leverage_limitado = True
+    else:
+        qty, notional = build(lev_final)
+        # Si por la cuantización al step aún no cabe, subir dentro del máximo
+        if not fits(qty, notional):
+            cand = _round_up(lev_final + lev_step, lev_step)
+            found = False
+            while cand <= max_lev + 1e-9:
+                q, n = build(cand)
+                if fits(q, n):
+                    qty, notional, lev_final = q, n, cand
+                    found = True
+                    break
+                cand = _round_up(cand + lev_step, lev_step)
+            if not found:
+                raise ValueError(
+                    f"No se puede abrir la posición con {margen} USDT: el mínimo del símbolo "
+                    f"({min_order_qty} {base_coin}) requiere más margen o un SL más corto."
+                )
+            subido_min = True
+        leverage_limitado = False
+
+    # Leverage realmente alcanzado por la posición (notional / margen)
+    leverage_final = round(notional / margen, 6) if margen else 0
+    if leverage_final > max_lev + 1e-9:
         leverage_final = max_lev
-        notional_max = margen * max_lev
-        qty_max = notional_max / entry
-        qty_ajustada = math.floor(qty_max / qty_step) * qty_step
-        qty_ajustada = round(qty_ajustada, qty_decimals)
-        notional_real = qty_ajustada * entry
 
-        if qty_ajustada < min_order_qty:
-            raise ValueError(f"La cantidad ajustada ({qty_ajustada}) es menor que el mínimo permitido ({min_order_qty}). Aumenta el margen.")
-        if min_notional > 0 and notional_real < min_notional:
-            raise ValueError(f"El notional ({notional_real:.2f} USDT) es menor que el mínimo permitido ({min_notional} USDT). Aumenta el margen.")
+    margen_usado = margen
+    riesgo_real = notional * distancia
 
-        margen_usado = notional_real / leverage_final
-
-    riesgo_real = notional_real * distancia
+    # Nota explicativa
+    nota = ""
+    if leverage_teorico > max_lev + 1e-9:
+        nota = f"Leverage limitado al máximo del símbolo ({max_lev:.0f}x)."
+    elif subido_min:
+        nota = (f"Leverage subido a {leverage_final:.2f}x para cumplir el mínimo del símbolo "
+                f"({min_order_qty} {base_coin} ≈ {min_order_qty*entry:.2f} USDT).")
 
     return {
         "direccion": direccion,
         "leverage_teorico": round(leverage_teorico, 2),
         "leverage_final": leverage_final,
         "max_leverage_simbolo": max_lev,
-        "leverage_limitado": leverage_limitado,
-        "qty": qty_ajustada,
-        "notional_usdt": round(notional_real, 2),
+        "leverage_limitado": (leverage_teorico > max_lev + 1e-9) or subido_min,
+        "qty": qty,
+        "notional_usdt": round(notional, 2),
         "margen_usado": round(margen_usado, 2),
         "margen_solicitado": margen,
         "riesgo_real_usdt": round(riesgo_real, 2),
         "distancia_sl_pct": round(distancia * 100, 4),
         "min_notional": min_notional,
         "qty_step": qty_step,
+        "qty_decimals": _step_decimals(qty_step),
+        "nota": nota,
         "data_source": instrument_wrapper["source"].upper()
     }
 
@@ -504,6 +566,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .btn-fav { width: 100%; margin-top: 10px; padding: 10px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.15); background: rgba(0, 0, 0, 0.2); color: #ccc; font-weight: 600; font-size: 14px; cursor: pointer; transition: all 0.2s; }
         .btn-fav:hover { color: #fff; border-color: rgba(247, 166, 0, 0.5); }
         .btn-fav.active { color: #f7a600; border-color: #f7a600; background: rgba(247, 166, 0, 0.12); }
+        .result-note { background: rgba(247, 166, 0, 0.12); border-left: 3px solid #f7a600; color: #f7a600; padding: 10px 12px; border-radius: 6px; font-size: 12px; margin-bottom: 12px; }
     </style>
 </head>
 <body>
@@ -753,6 +816,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
                     resultBox.html(
                         '<h5 class="mb-3">' + dirBadge + ' ' + data.symbol + ' ' + warnLev + ' ' + sourceBadge + '</h5>' +
+                        (data.nota ? '<div class="result-note">⚠ ' + data.nota + '</div>' : '') +
                         '<div class="highlight-margen">' +
                             '<div class="result-item"><span class="result-label">Margen solicitado</span><span class="result-value">' + data.margen_solicitado.toFixed(2) + ' USDT</span></div>' +
                             '<div class="result-item"><span class="result-label">Margen usado</span><span class="result-value">' + data.margen_usado.toFixed(2) + ' USDT ' + margenBadge + '</span></div>' +
